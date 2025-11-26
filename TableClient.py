@@ -61,13 +61,22 @@ class TableClient:
         self._column_value_mask: List[bool] = []
         self._storage_client = None
 
+        import os
         try:
-            import os
             host = os.getenv("host")
             port = os.getenv("port")
-            self._storage_client = KVClient(host=host, port=port)
+
+            # 这里假定 KVClient(host=..., port=...) 是合法初始化方式
+            # 若环境变量未设置,直接抛错,让调用方在启动时就发现问题
+            if host is None or port is None:
+                raise RuntimeError("env 'host' or 'port' not set")
+
+            self._storage_client = KVClient(host=host, port=int(port))
+            # 若 KVClient 需要显式初始化,在这里做一次
+            if hasattr(self._storage_client, "init"):
+                self._storage_client.init()
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize storage client: {e}")
+            raise RuntimeError(f"Failed to initialize storage client: {e}") from e
 
 
     def connect_table(self, table_name: str) -> bool:
@@ -151,7 +160,44 @@ class TableClient:
             False 表示连接失败(例如 actor 不存在或调用 get_column_info 失败)。
 
         """
+        actor_name = f"SampleTable-{table_name}"
 
+        try:
+            # 1. Get the actor handle for SampleTableManager
+            table_handler = ray.get_actor(actor_name)
+        except Exception:
+            # actor does not exist or Ray not initialized
+            return False
+
+        try:
+            # 2. Remote call to get_table_column_info() to get column info
+            info_ref = table_handler.get_table_column_info.remote()
+            column_info = ray.get(info_ref)
+        except Exception:
+            # RPC failure or execution exception, consider connection failed
+            return False
+
+        # 3. Analysis Metadata
+        try:
+            column_name = list(column_info["column_name"])
+            column_type = list(column_info["column_type"])
+            column_value_mask = list(column_info["column_value_mask"])
+        except KeyError:
+            return False
+
+        # 4. Length Check
+        if not (
+            len(column_name) == len(column_type) == len(column_value_mask)
+        ):
+            return False
+
+        self._table_name = table_name
+        self._table_handler = table_handler
+        self._column_name = column_name
+        self._column_type = column_type
+        self._column_value_mask = column_value_mask
+
+        return True
 
 
     def insert_samples(
@@ -247,7 +293,7 @@ class TableClient:
             False 表示存在至少一条样本或一列写入失败。
 
         """
-
+        
 
 
     def retrieve_sample_columns(
