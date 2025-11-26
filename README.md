@@ -1,2 +1,2 @@
-# HUAWEI-SampleTable
-Data Sample System with Huawei Yuanrong Data System
+# SampleTable
+Sample Data System Developed Based on the Huawei Yuanrong Data System
