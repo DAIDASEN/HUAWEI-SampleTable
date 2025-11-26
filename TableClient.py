@@ -219,81 +219,124 @@ class TableClient:
         """
 
         功能描述:
-
         向当前已连接的表中插入一批样本。样本由 policy_version、column_name、
-
         sample_value 和可选的 sample_id 描述。内部会根据列类型/存储策略,将
-
         大数据列写入后端数据系统,并将对应的 location_key 写入 SampleTableManager;
-
         对元数据列则直接写入 SampleTableManager。
 
-
-
         对调用方提供同步语义:
-
           - 返回 True 表示:
-
               * 对应大数据列已写入后端存储系统;
-
               * SampleTableManager.insertSamples 已成功完成,并写入元数据表。
-
           - 返回 False 表示插入过程存在失败(部分或全部失败)。
 
-
-
         参数:
-
         policy_version: int
-
             本批样本对应的策略版本。
 
-
-
         column_name: list[str]
-
             本次插入涉及的列名列表,必须是当前表列名的子集。
 
-
-
         sample_value: list[list[Any]]
-
             二维列表,外层长度为样本条数 N,内层长度为 len(column_name),
-
             表示每条样本在各列上的真实值。对于大数据列,TableClient 内部会
-
             将真实值写入后端数据系统,并将返回的 key 作为写入 SampleTableManager
-
             的值。
 
-
-
         sample_id: Optional[list[str]](默认 None)
-
             每条样本的 sample_id 列表:
-
               - 若为 None,则自动生成 sample_id(基于 input_id/turn/trajectory_id)。
-
               - 若非 None,则长度必须与样本条数一致,用于支持跨 agent 传递样本。
 
-
-
         rollout_n: int(默认 1)
-
             针对 GRPO 等算法,每条样本复制的份数,用于自动设置 sample_id(client不需处理 sample_id 的生成)。
 
-
-
         返回值:
-
         bool:
-
             True  表示所有样本插入成功;
-
             False 表示存在至少一条样本或一列写入失败。
-
         """
-        
+        num_rows = len(sample_value)
+        num_cols = len(column_name)
+
+        # 基本形状检查
+        for row in sample_value:
+            if len(row) != num_cols:
+                raise ValueError(
+                    "Each inner list of 'sample_value' must have "
+                    "the same length as 'column_name'."
+                )
+
+        # 检查列是否存在于当前表
+        col_index_in_schema: List[int] = []
+        for col in column_name:
+            try:
+                idx = self._column_name.index(col)
+            except ValueError:
+                raise KeyError(
+                    f"Column '{col}' is not in table schema of '{self._table_name}'."
+                )
+            col_index_in_schema.append(idx)
+
+        # 拷贝一份, 里面会被替换成按值 / 按引用要写入 SampleTableManager 的内容
+        stored_values: List[List[Any]] = [list(row) for row in sample_value]
+
+        # 用于失败回滚: 仅记录按引用列写入 Yuanrong 的所有 keys
+        all_location_keys: List[str] = []
+
+        # 按列处理
+        for col_pos, col in enumerate(column_name):
+            schema_idx = col_index_in_schema[col_pos]
+            is_value_column = self._column_value_mask[schema_idx]
+
+            # 这一列的实际值(按行展开)
+            col_values = [row[col_pos] for row in sample_value]
+
+            if is_value_column:
+                # 元数据列: 直接写入, 有需要可以在这里调用 _cast_value 做类型转换
+                # converted = self._cast_value(col, col_values)
+                converted = col_values  # 先保持原样
+                for r in range(num_rows):
+                    stored_values[r][col_pos] = converted[r]
+            else:
+                # 按引用列: 为每一行生成一个 location_key, 写入 Yuanrong
+                location_keys = self._generate_keys(num_rows, prefix=f"{self._table_name}:{col}:")
+                ok_storage = self.__write_data(location_keys, col_values)
+                if not ok_storage:
+                    # 写 Yuanrong 失败, 尝试删除刚才写入的 keys(防御性处理)
+                    try:
+                        if location_keys:
+                            self._storage_client.delete(location_keys)
+                    except Exception:
+                        pass
+                    return False
+
+                all_location_keys.extend(location_keys)
+                for r in range(num_rows):
+                    stored_values[r][col_pos] = location_keys[r]
+
+        # 写元数据表: SampleTableManager.insert_samples
+        try:
+            obj_ref = self._table_handler.insert_samples.remote(
+                policy_version,
+                column_name,
+                stored_values,
+                sample_id,
+                rollout_n,
+            )
+            ok_meta: bool = bool(ray.get(obj_ref))
+        except Exception:
+            ok_meta = False
+
+        if not ok_meta and all_location_keys:
+            # 元数据写失败, 回滚 Yuanrong 中刚写入的 keys
+            try:
+                self._storage_client.delete(all_location_keys)
+            except Exception:
+                pass
+
+        return ok_meta
+
 
 
     def retrieve_sample_columns(
@@ -619,6 +662,13 @@ class TableClient:
             True  表示所有样本的指定列均更新成功;
             False 表示存在至少一个样本/列更新失败。
         """
+        if self._table_handler is None or self._table_name is None:
+            raise RuntimeError("connect_table() must be called before write_sample_columns().")
+
+        if not sample_id or not column_name:
+            return True
+
+
 
 
 
@@ -685,13 +735,18 @@ class TableClient:
 
         参数:
         key: list[str]
-        用于从元戎数据系统中读取源数据的 key。
+        用于从元戎数据系统中读取源数据的 value。
 
         返回值:
         sample_value: list[Any]
         读取的数据值。
         """
-
+        if not key:
+            return []
+        if self._storage_client is None:
+            raise RuntimeError("Storage client is not initialized.")
+        #TODO: 有一个返回值转换为str的参数(convert_to_str), 这个用不用
+        return self._storage_client.get(key)
 
 
     def __write_data(
@@ -715,7 +770,23 @@ class TableClient:
         返回值:
         写入是否成功。
         """
-
+        if not key:
+            return True
+        if self._storage_client is None:
+            raise RuntimeError("Storage client is not initialized.")
+        if len(key) != len(sample_value):
+            raise ValueError("Length of 'key' and 'sample_value' must be equal.")
+        # mset传入的量不能大于2000
+        MAX_BATCH = 1900
+        try:
+            for start in range(0, len(key), MAX_BATCH):
+                end = start + MAX_BATCH
+                batch_keys = key[start:end]
+                batch_vals = sample_value[start:end]
+                self._storage_client.mset(batch_keys, batch_vals)
+            return True
+        except Exception:
+            return False
 
 
     def _cast_value(
@@ -743,3 +814,27 @@ class TableClient:
         converted_column_value: list[Any]
         返回转换后的单个列的值。
         """
+
+
+    #TODO: 新加了一个生成key的函数，方便写一点
+    def _generate_keys(self, n: int, prefix: str = "") -> List[str]:
+        """
+        使用 KVClient.generate_key 生成 n 个唯一 key。
+
+        文档示例中 generate_key 可能一次返回多个以 ';' 分隔的 key,
+        所以这里做了拆分和截断处理, 保证最终长度为 n。
+        """
+        if self._storage_client is None:
+            raise RuntimeError("Storage client is not initialized.")
+        if n <= 0:
+            return []
+
+        keys: List[str] = []
+        while len(keys) < n:
+            raw = self._storage_client.generate_key(prefix)
+            if not raw:
+                raise RuntimeError("KVClient.generate_key() returned empty string.")
+            parts = [p for p in raw.split(";") if p]
+            keys.extend(parts)
+
+        return keys[:n]
