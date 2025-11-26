@@ -7,7 +7,7 @@ class SampleTableManager:
         column_name: list[str], 
         column_type: list[str]
     ) -> None:
-    """
+        """
     功能描述：
     在 driver 上为每个 agent 创建一个 SampleTable 实例。
 
@@ -33,7 +33,7 @@ class SampleTableManager:
         sample_id: Optional[list[str]] = None,
         rollout_n: int = 1,
     ) -> bool:
-    """
+        """
     功能描述：
     将指定 policy_version 下的一批 sample 插入表格中。sample_id 会自动生成，格式为"{input_id}_{number_of_turns}_{trajectory_id}"。
     对于 next agent 的样本插入，为了保证 sample_id 的连贯性，需显式填入 sample_id（由 last agent 生成）。
@@ -65,7 +65,7 @@ class SampleTableManager:
         batch_size: int = -1,
         condition: Optional[str] = None,
     ) -> tuple[list[str], dict[str, list[Any]]]:
-    """
+        """
     功能描述：
     在指定 policy_version 下，按照 condition 条件过滤样本行，返回 batch_size 个样本对应的指定列的值。
 
@@ -96,7 +96,7 @@ class SampleTableManager:
         column_name: list[str],
         sample_value: dict[str, list[Any]],
     ) -> bool:
-    """
+        """
     功能描述：
     根据 sample_id 和 column_name 为已有样本写入或覆盖源数据。
 
@@ -119,7 +119,7 @@ class SampleTableManager:
         policy_version: int = -1, 
         condition: Optional[str] = None,
     ) -> bool:
-    """
+        """
     功能描述：
     删除指定策略版本下，满足条件 condition 的所有行的元数据（SampleTable 中的记录）以及对应的源数据（后端存储中的记录）。
     策略版本和 condition 至少需要指定一个。
@@ -139,7 +139,7 @@ class SampleTableManager:
         sample_id: str,
         column_name: str,
     ) -> Any:
-    """
+        """
     功能描述：
     根据 sample_id 和 column_name 从后端存储系统读取 sample_value，用于实现 condition 条件判断。
 
@@ -161,7 +161,7 @@ class SampleTableManager:
         column_name: str,
         sample_value: Any,
     ) -> tuple[bool, str]:
-    """
+        """
     功能描述：
     逐条将sample (sample_id, column_name, sample_value) 写入后端存储系统，并返回写入状态和位置（key）。
     policy_version、sample_id 以及 status 字段直接存储在表格中。
