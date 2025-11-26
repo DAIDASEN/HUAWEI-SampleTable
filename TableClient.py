@@ -78,7 +78,6 @@ class TableClient:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize storage client: {e}") from e
 
-
     def connect_table(self, table_name: str) -> bool:
 
         """
@@ -199,7 +198,6 @@ class TableClient:
 
         return True
 
-
     def insert_samples(
 
         self,
@@ -258,16 +256,14 @@ class TableClient:
         """
         num_rows = len(sample_value)
         num_cols = len(column_name)
-
-        # 基本形状检查
+        # 长度合法性
         for row in sample_value:
             if len(row) != num_cols:
                 raise ValueError(
                     "Each inner list of 'sample_value' must have "
                     "the same length as 'column_name'."
                 )
-
-        # 检查列是否存在于当前表
+        #列名合法性
         col_index_in_schema: List[int] = []
         for col in column_name:
             try:
@@ -278,10 +274,9 @@ class TableClient:
                 )
             col_index_in_schema.append(idx)
 
-        # 拷贝一份, 里面会被替换成按值 / 按引用要写入 SampleTableManager 的内容
         stored_values: List[List[Any]] = [list(row) for row in sample_value]
 
-        # 用于失败回滚: 仅记录按引用列写入 Yuanrong 的所有 keys
+        # 失败回滚备份
         all_location_keys: List[str] = []
 
         # 按列处理
@@ -293,8 +288,6 @@ class TableClient:
             col_values = [row[col_pos] for row in sample_value]
 
             if is_value_column:
-                # 元数据列: 直接写入, 有需要可以在这里调用 _cast_value 做类型转换
-                # converted = self._cast_value(col, col_values)
                 converted = col_values  # 先保持原样
                 for r in range(num_rows):
                     stored_values[r][col_pos] = converted[r]
@@ -303,7 +296,7 @@ class TableClient:
                 location_keys = self._generate_keys(num_rows, prefix=f"{self._table_name}:{col}:")
                 ok_storage = self.__write_data(location_keys, col_values)
                 if not ok_storage:
-                    # 写 Yuanrong 失败, 尝试删除刚才写入的 keys(防御性处理)
+                    # 写 Yuanrong 失败, 尝试删除刚才写入的 keys
                     try:
                         if location_keys:
                             self._storage_client.delete(location_keys)
@@ -336,8 +329,6 @@ class TableClient:
                 pass
 
         return ok_meta
-
-
 
     def retrieve_sample_columns(
 
@@ -401,41 +392,44 @@ class TableClient:
 
               - batch_size > 0:返回 batch_size 条样本。
 
-
-
         condition: str(默认 "")
-
             过滤条件字符串,例如:
-
               "reward_status == True and reward > 0"。
-
             具体语法由 SampleTableManager 内部条件解析逻辑定义。
 
-
-
         返回值:
-
         (sample_ids, sample_value)
-
         sample_ids: list[str]
-
             返回的样本 ID 列表。
 
-
-
         sample_value: dict[str, list[Any]]
-
             列名到列值列表的映射:
-
               - key   为 sample_id;
-
               - value 为该 sample 对应的值列表,长度与 column_name 对齐。
-
             注意,对于大数据列,返回的是从数据系统中读取的真实值,而非 location_key。
-
         """
+        if self._table_handler is None:
+            raise RuntimeError("TableClient is not connected to any table.")
 
+        # 1) 异步拿 meta
+        obj_ref = self.retrieveSampleColumnKeysAsync(
+            policy_version=policy_version,
+            column_name=column_name,
+            batch_size=batch_size,
+            condition=condition,
+        )
 
+        # 2) 同步等待 meta
+        sample_ids, sample_key = ray.get(obj_ref)
+
+        # 3) 拉真实数据并做类型转换
+        sample_value = self.retrieveSampleColumnValues(
+            column_name=column_name,
+            sample_id=sample_ids,
+            sample_key=sample_key,
+        )
+
+        return sample_ids, sample_value
 
     def retrieveSampleColumnKeysAsync(
 
@@ -454,19 +448,12 @@ class TableClient:
         """
 
         功能描述:
-
         异步从当前已连接的表中同步获取一批样本数据。
-
         本接口仅返回 ObjectRef,不会在调用线程中阻塞等待结果。
-
         拿到 ObjectRef 的表格数据后,用户还需要调用 retrieveSampleColumnValues 获取真实数据。
 
-
-
         内部流程:
-
           - 调用 SampleTableManager.retrieveSampleColumns.remote(...),
-
             得到一个 ObjectRef;
 
           - 该 ObjectRef 内部结果为:
@@ -546,8 +533,35 @@ class TableClient:
               (sample_id: list[str], sample_key: dict[str, list[Any]])。
 
         """
+        if self._table_handler is None:
+            raise RuntimeError("TableClient is not connected to any table.")
 
+        # 简单校验列名在当前表 schema 中
+        for col in column_name:
+            if col not in self._column_name:
+                raise KeyError(
+                    f"Column '{col}' is not in table schema of '{self._table_name}'."
+                )
 
+        # 这里按你给的接口, SampleTableManager 用的是 snake_case:
+        #   retrieve_sample_columns(policy_version, column_name, batch_size, condition)
+        obj_ref = self._table_handler.retrieve_sample_columns.remote(
+            policy_version,
+            column_name,
+            batch_size,
+            condition,
+        )
+        return obj_ref
+    '''
+    调用逻辑:
+    meta_future = client.retrieveSampleColumnKeysAsync(...)
+    # do_other_work()
+    ready, _ = ray.wait([meta_future], timeout=0.0)
+    if ready:
+        sample_ids, key_dict = ray.get(ready[0])
+        sample_value = client.retrieveSampleColumnValues(column_name, sample_ids, key_dict)
+
+    '''
 
     def retrieveSampleColumnValues(
 
@@ -615,8 +629,49 @@ class TableClient:
               - value 为该 sample 对应的值列表,长度与 column_name 对齐。
             注意,对于大数据列,返回的是从数据系统中读取的真实值,而非 location_key。
         """
+        if self._table_handler is None:
+            raise RuntimeError("TableClient is not connected to any table.")
 
+        num_rows = len(sample_id)
+        if num_rows == 0 or not column_name:
+            return {}
 
+        # 列名 -> 在 schema 中的 index
+        name_to_idx = {name: i for i, name in enumerate(self._column_name)}
+        result: Dict[str, List[Any]] = {}
+
+        for col in column_name:
+            if col not in sample_key:
+                raise KeyError(f"Column '{col}' is missing in sample_key dict.")
+            if col not in name_to_idx:
+                raise KeyError(
+                    f"Column '{col}' is not in table schema of '{self._table_name}'."
+                )
+
+            raw_list = list(sample_key[col])
+            if len(raw_list) != num_rows:
+                raise ValueError(
+                    f"Length of sample_key['{col}'] ({len(raw_list)}) "
+                    f"does not match number of sample_ids ({num_rows})."
+                )
+
+            schema_idx = name_to_idx[col]
+            is_value_column = self._column_value_mask[schema_idx]
+
+            if is_value_column:
+                # 按值列: sample_key 里已经是值(通常是 str), 直接按列类型做一次转换
+                converted = self._cast_value(col, raw_list)
+                result[col] = converted
+            else:
+                # 按引用列: sample_key 里是 location_key, 先从 Yuanrong 读取再转换类型
+                location_keys = [k for k in raw_list if k is not None]
+                # 这里假设所有行都有 key; 若允许 None, 可按索引对齐填 None
+                values_str = self.__retrieve_data(location_keys)
+                # values_str 已经是字符串, 再按列类型转为目标 Python 类型
+                converted = self._cast_value(col, values_str)
+                result[col] = converted
+
+        return result
 
     def write_sample_columns(
 
@@ -662,15 +717,79 @@ class TableClient:
             True  表示所有样本的指定列均更新成功;
             False 表示存在至少一个样本/列更新失败。
         """
-        if self._table_handler is None or self._table_name is None:
-            raise RuntimeError("connect_table() must be called before write_sample_columns().")
+        if self._table_handler is None:
+            raise RuntimeError("TableClient is not connected to any table.")
 
         if not sample_id or not column_name:
             return True
 
+        num_rows = len(sample_id)
 
+        # 检查列是否存在于当前表, 以及 sample_value 的长度是否一致
+        col_index_in_schema: List[int] = []
+        for col in column_name:
+            try:
+                idx = self._column_name.index(col)
+            except ValueError:
+                raise KeyError(
+                    f"Column '{col}' is not in table schema of '{self._table_name}'."
+                )
+            col_index_in_schema.append(idx)
 
+            if col not in sample_value:
+                raise KeyError(f"Column '{col}' is missing in sample_value dict.")
+            if len(sample_value[col]) != num_rows:
+                raise ValueError(
+                    f"Length of sample_value['{col}'] must equal length of sample_id."
+                )
 
+        # 要传给 SampleTableManager 的最终字典
+        combined_sample_value: Dict[str, List[Any]] = {}
+
+        # 用于失败回滚
+        new_location_keys: List[str] = []
+
+        for col, schema_idx in zip(column_name, col_index_in_schema):
+            is_value_column = self._column_value_mask[schema_idx]
+            col_values = sample_value[col]
+
+            if is_value_column:
+                combined_sample_value[col] = col_values
+            else:
+                # 按引用列: 为每个 sample_id 生成一个 key
+                location_keys = self._generate_keys(
+                    num_rows, prefix=f"{self._table_name}:{col}:"
+                )
+                ok_storage = self.__write_data(location_keys, col_values)
+                if not ok_storage:
+                    # Yuanrong失败回滚
+                    try:
+                        if location_keys:
+                            self._storage_client.delete(location_keys)
+                    except Exception:
+                        pass
+                    return False
+
+                new_location_keys.extend(location_keys)
+                combined_sample_value[col] = location_keys
+
+        # 写入/更新元数据
+        try:
+            obj_ref = self._table_handler.write_sample_columns.remote(
+                sample_id, column_name, combined_sample_value
+            )
+            ok_meta: bool = bool(ray.get(obj_ref))
+        except Exception:
+            ok_meta = False
+
+        if not ok_meta and new_location_keys:
+            # 失败回滚
+            try:
+                self._storage_client.delete(new_location_keys)
+            except Exception:
+                pass
+
+        return ok_meta
 
     def delete_samples(
 
@@ -716,8 +835,61 @@ class TableClient:
             True  表示所有目标样本和对应源数据均成功删除;
             False 表示存在删除失败的情况。
         """
+        if self._table_handler is None:
+            raise RuntimeError("TableClient is not connected to any table.")
 
+        #TODO: 禁止删除整表
+        if policy_version <= 0 and not condition:
+            raise ValueError(
+                "Dangerous operation: deleting whole table without condition "
+                "is not allowed by TableClient.delete_samples."
+            )
 
+        # 找出所有按引用列的列名
+        ref_columns: List[str] = [
+            name for name, mask in zip(self._column_name, self._column_value_mask) if not mask
+        ]
+
+        # 1) 从 SampleTableManager 中拿到这些按引用列的 location_key
+        location_keys: List[str] = []
+        if ref_columns:
+            try:
+                obj_ref = self._table_handler.retrieve_sample_columns.remote(
+                    policy_version,
+                    ref_columns,
+                    -1, 
+                    condition if condition else None,
+                )
+                _, key_dict = ray.get(obj_ref)  
+            except Exception:
+                return False
+
+            # key_dict: {col_name: [key1, key2, ...]}
+            for col in ref_columns:
+                col_keys = key_dict.get(col, [])
+                for k in col_keys:
+                    if isinstance(k, str) and k:
+                        location_keys.append(k)
+
+        # 2) 调用 SampleTableManager.delete_samples 删除元数据行
+        try:
+            obj_ref = self._table_handler.delete_samples.remote(
+                policy_version, condition if condition else None
+            )
+            ok_meta: bool = bool(ray.get(obj_ref))
+        except Exception:
+            ok_meta = False
+
+        # 3) 删除 Yuanrong KV 中的真实数据
+        ok_storage = True
+        if location_keys:
+            try:
+                failed_keys = self._storage_client.delete(location_keys)
+                ok_storage = len(failed_keys) == 0
+            except Exception:
+                ok_storage = False
+
+        return ok_meta and ok_storage
 
     '''============以下为内部私有函数============'''
 
@@ -743,10 +915,14 @@ class TableClient:
         """
         if not key:
             return []
+
         if self._storage_client is None:
             raise RuntimeError("Storage client is not initialized.")
-        #TODO: 有一个返回值转换为str的参数(convert_to_str), 这个用不用
-        return self._storage_client.get(key)
+        
+        values = self._storage_client.get(key, convert_to_str=True)
+        # 统一为list
+        return list(values)
+
 
 
     def __write_data(
@@ -814,7 +990,55 @@ class TableClient:
         converted_column_value: list[Any]
         返回转换后的单个列的值。
         """
+        if column_name not in self._column_name:
+            return column_value
 
+        idx = self._column_name.index(column_name)
+        type_name = str(self._column_type[idx]).lower().strip()
+
+        converted: List[Any] = []
+
+        for v in column_value:
+            if v is None:
+                converted.append(None)
+                continue
+
+            try:
+                # 统一拿字符串, 方便 int/float 解析; 已经是数字的就直接用
+                s = v
+                if isinstance(v, bytes):
+                    s = v.decode("utf-8", errors="ignore")
+                if isinstance(s, str):
+                    s_str = s.strip()
+                else:
+                    s_str = str(s)
+
+                if type_name in ("int", "int32", "int64", "integer"):
+                    converted.append(int(s_str))
+                elif type_name in ("float", "float32", "float64", "double"):
+                    converted.append(float(s_str))
+                elif type_name in ("bool", "boolean"):
+                    if isinstance(v, bool):
+                        converted.append(v)
+                    else:
+                        low = s_str.lower()
+                        if low in ("1", "true", "yes"):
+                            converted.append(True)
+                        elif low in ("0", "false", "no"):
+                            converted.append(False)
+                        else:
+                            converted.append(bool(s_str))
+                elif type_name in ("str", "string", "text"):
+                    converted.append(s_str)
+                else:
+                    # 未知类型, 保持原样
+                    converted.append(v)
+            except Exception:
+                # 转换失败就保留原值
+                converted.append(v)
+
+        return converted
+        
 
     #TODO: 新加了一个生成key的函数，方便写一点
     def _generate_keys(self, n: int, prefix: str = "") -> List[str]:
